@@ -1,288 +1,166 @@
 /**
  * HaxZero - High Performance Haxball Mobile Client
- * Otimizado para Android intermediário | Latência mínima | Zero travamentos
+ * Otimizado para Android com Injector | Latência mínima | Zero travamentos
  * 
  * Arquitetura:
- * - Module Pattern (encapsulation)
- * - Object Pool (reuso de objetos)
- * - Event delegation (menos listeners)
- * - Throttle/Debounce (reduz processamento)
- * - DOM caching (queries otimizadas)
- * - Typed Arrays (quando aplicável)
+ * - Detecção automática de ambiente (Injector vs Browser)
+ * - Joystick overlay fullscreen
+ * - Object Pool para reduzir GC
+ * - Throttle/Debounce para eventos
  */
 
 // ============================================================================
-// 1. UTILIDADES DE PERFORMANCE
+// 1. DETECÇÃO DE AMBIENTE
+// ============================================================================
+
+const ENV = (() => {
+    const isInjector = typeof window.injector !== 'undefined' || 
+                      typeof window.sendMessage !== 'undefined' ||
+                      navigator.userAgent.includes('HaxBall');
+    
+    const isMobile = /Android|iPhone|iPad|iPod/.test(navigator.userAgent);
+    
+    console.log(`[HaxZero] Ambiente: ${isInjector ? 'Injector' : 'Browser'} | Mobile: ${isMobile}`);
+    
+    return { isInjector, isMobile };
+})();
+
+// ============================================================================
+// 2. PERFORMANCE UTILITIES
 // ============================================================================
 
 const PerfUtils = (() => {
-    // Cache de funções throttled
     const throttledFunctions = new Map();
-    const debouncedFunctions = new Map();
 
-    /**
-     * Throttle: limita execução a cada N ms
-     * Use: eventos de alta frequência (touch, scroll)
-     */
     function throttle(fn, delay, id) {
         if (!throttledFunctions.has(id)) {
             let lastCall = 0;
+            let rafId = null;
+            
             throttledFunctions.set(id, function(...args) {
                 const now = performance.now();
+                
+                if (rafId) cancelAnimationFrame(rafId);
+                
                 if (now - lastCall >= delay) {
                     lastCall = now;
                     fn.apply(this, args);
+                } else {
+                    rafId = requestAnimationFrame(() => {
+                        lastCall = performance.now();
+                        fn.apply(this, args);
+                    });
                 }
             });
         }
         return throttledFunctions.get(id);
     }
 
-    /**
-     * Debounce: executa após N ms sem chamadas
-     * Use: input de usuário, resize
-     */
-    function debounce(fn, delay, id) {
-        if (!debouncedFunctions.has(id)) {
-            let timeoutId = null;
-            debouncedFunctions.set(id, function(...args) {
-                if (timeoutId) clearTimeout(timeoutId);
-                timeoutId = setTimeout(() => {
-                    fn.apply(this, args);
-                    timeoutId = null;
-                }, delay);
-            });
-        }
-        return debouncedFunctions.get(id);
-    }
-
-    /**
-     * Memoization para funções puras
-     */
-    function memoize(fn) {
-        const cache = new Map();
-        return function(...args) {
-            const key = JSON.stringify(args);
-            if (cache.has(key)) {
-                return cache.get(key);
-            }
-            const result = fn.apply(this, args);
-            cache.set(key, result);
-            return result;
-        };
-    }
-
-    return { throttle, debounce, memoize };
+    return { throttle };
 })();
 
 // ============================================================================
-// 2. OBJECT POOL - Reutiliza objetos para reduzir GC
+// 3. VIRTUAL JOYSTICK - Otimizado para Touch
 // ============================================================================
 
-const ObjectPool = (() => {
-    const pools = new Map();
-
-    function createPool(name, factory, initialSize = 10) {
-        const available = [];
-        const inUse = new Set();
-
-        // Pré-aloca objetos
-        for (let i = 0; i < initialSize; i++) {
-            available.push(factory());
-        }
-
-        pools.set(name, { available, inUse, factory });
-    }
-
-    function acquire(poolName) {
-        const pool = pools.get(poolName);
-        if (!pool) return pool.factory();
-
-        let obj = pool.available.pop();
-        if (!obj) {
-            obj = pool.factory();
-        }
-        pool.inUse.add(obj);
-        return obj;
-    }
-
-    function release(poolName, obj) {
-        const pool = pools.get(poolName);
-        if (!pool) return;
-
-        pool.inUse.delete(obj);
-        
-        // Reset do objeto
-        if (obj.reset) obj.reset();
-        
-        pool.available.push(obj);
-    }
-
-    return { createPool, acquire, release };
-})();
-
-// ============================================================================
-// 3. DOM CACHE - Reduz querySelector calls
-// ============================================================================
-
-const DOMCache = (() => {
-    const cache = new Map();
-    let gameFrame = null;
-    let body = null;
-
-    function init(frame) {
-        gameFrame = frame;
-    }
-
-    function setBody(bodyElement) {
-        body = bodyElement;
-    }
-
-    function query(selector, context = document) {
-        const key = `${selector}:${context === gameFrame ? 'frame' : 'main'}`;
-        
-        if (cache.has(key)) {
-            return cache.get(key);
-        }
-
-        const element = context.querySelector(selector);
-        if (element) {
-            cache.set(key, element);
-        }
-        return element;
-    }
-
-    function queryAll(selector, context = document) {
-        return context.querySelectorAll(selector);
-    }
-
-    /**
-     * Getter seguro com fallback
-     */
-    function getByHook(hook) {
-        return body?.querySelector(`[data-hook="${hook}"]`) || null;
-    }
-
-    function invalidate(selector) {
-        cache.forEach((_, key) => {
-            if (key.includes(selector)) {
-                cache.delete(key);
-            }
-        });
-    }
-
-    function clear() {
-        cache.clear();
-    }
-
-    return {
-        init,
-        setBody,
-        query,
-        queryAll,
-        getByHook,
-        invalidate,
-        clear
-    };
-})();
-
-// ============================================================================
-// 4. CONTROLS - Sistema de joystick otimizado
-// ============================================================================
-
-const ControlSystem = (() => {
+const VirtualJoystick = (() => {
+    let container = null;
     let joystick = null;
-    let kickButton = null;
     let thumb = null;
+    let kickButton = null;
     let isTouching = false;
     
-    // Cache de estado para evitar redraws desnecessários
-    let lastJoystickDirection = "";
+    let lastDirection = "";
     let lastKickState = false;
 
-    // Direções pré-calculadas (evita cálculos em loop)
-    const DIRECTIONS = {
-        0: "d",    // direita
-        1: "sd",   // sul-direita
-        2: "s",    // sul
-        3: "sa",   // sul-esquerda
-        4: "a",    // esquerda
-        5: "wa",   // norte-esquerda
-        6: "w",    // norte
-        7: "wd"    // norte-direita
-    };
+    const DIRECTIONS = ["d", "sd", "s", "sa", "a", "wa", "w", "wd"];
+    const DEAD_ZONE = 0.15;
 
-    const THRESHOLD_CENTER = 0.1;
-    const THRESHOLD_MOTION = 0.5;
+    function createUI() {
+        // Container principal
+        container = document.createElement("div");
+        container.id = "haxzero-controls";
+        container.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 9999;
+        `;
 
-    /**
-     * Converte coordenadas (x, y) para direção (0-7)
-     * Otimizado: evita cálculos repetidos
-     */
+        // Joystick (esquerda)
+        joystick = document.createElement("div");
+        joystick.id = "haxzero-joystick";
+        joystick.style.cssText = `
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            background: rgba(100, 150, 200, 0.3);
+            border: 2px solid rgba(100, 150, 200, 0.6);
+            pointer-events: auto;
+            touch-action: none;
+            display: none;
+        `;
+
+        thumb = document.createElement("div");
+        thumb.style.cssText = `
+            position: absolute;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: rgba(150, 180, 220, 0.7);
+            border: 2px solid rgba(150, 180, 220, 0.9);
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+        `;
+        joystick.appendChild(thumb);
+
+        // Kick Button (direita)
+        kickButton = document.createElement("button");
+        kickButton.id = "haxzero-kick";
+        kickButton.innerHTML = "⚽";
+        kickButton.style.cssText = `
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            background: rgba(220, 100, 100, 0.3);
+            border: 2px solid rgba(220, 100, 100, 0.6);
+            font-size: 50px;
+            pointer-events: auto;
+            touch-action: none;
+            cursor: pointer;
+            display: none;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+        `;
+
+        container.appendChild(joystick);
+        container.appendChild(kickButton);
+        document.body.appendChild(container);
+    }
+
     function getDirection(x, y) {
+        if (Math.abs(x) < DEAD_ZONE && Math.abs(y) < DEAD_ZONE) {
+            return "";
+        }
+        
         const angle = Math.atan2(y, x);
         const angleInDegrees = (angle >= 0 ? angle : 2 * Math.PI + angle) * (180 / Math.PI);
-        return Math.round(angleInDegrees / 45) % 8;
+        const index = Math.round(angleInDegrees / 45) % 8;
+        return DIRECTIONS[index];
     }
 
-    /**
-     * Emula teclas de movimento
-     * Evita criar objetos novos
-     */
-    const keyState = { w: false, a: false, s: false, d: false };
-
-    function emulateKeys(direction) {
-        // Se não mudou, retorna cedo
-        if (direction === lastJoystickDirection) return;
-        lastJoystickDirection = direction;
-
-        // Reset todos os estados
-        keyState.w = false;
-        keyState.a = false;
-        keyState.s = false;
-        keyState.d = false;
-
-        // Seta nova direção
-        if (direction === "") {
-            dispatchKeyEvent("keyup", "KeyW");
-            dispatchKeyEvent("keyup", "KeyA");
-            dispatchKeyEvent("keyup", "KeyS");
-            dispatchKeyEvent("keyup", "KeyD");
-            return;
-        }
-
-        // Processa cada caractere da direção
-        for (let i = 0; i < direction.length; i++) {
-            const char = direction[i];
-            keyState[char] = true;
-            dispatchKeyEvent("keydown", `Key${char.toUpperCase()}`);
-        }
-
-        // Seta keyup para as teclas não pressionadas
-        if (!keyState.w) dispatchKeyEvent("keyup", "KeyW");
-        if (!keyState.a) dispatchKeyEvent("keyup", "KeyA");
-        if (!keyState.s) dispatchKeyEvent("keyup", "KeyS");
-        if (!keyState.d) dispatchKeyEvent("keyup", "KeyD");
-    }
-
-    /**
-     * Dispara evento de teclado
-     */
-    function dispatchKeyEvent(type, code) {
-        try {
-            const gameFrame = document.querySelector('.gameframe')?.contentWindow;
-            if (gameFrame?.document) {
-                gameFrame.document.dispatchEvent(new KeyboardEvent(type, { code }));
-            }
-        } catch (e) {
-            console.error("Erro ao disparar evento de teclado:", e);
-        }
-    }
-
-    /**
-     * Atualiza posição visual do joystick
-     * Throttled para 60fps
-     */
     const updateJoystickThrottled = PerfUtils.throttle(function(touch) {
         if (!joystick || !thumb) return;
 
@@ -292,339 +170,199 @@ const ControlSystem = (() => {
 
         const deltaX = touch.clientX - centerX;
         const deltaY = touch.clientY - centerY;
-
-        const angle = Math.atan2(deltaY, deltaX);
+        
         const distance = Math.min(
             joystick.clientWidth / 2,
             Math.hypot(deltaX, deltaY)
         );
+        
+        const angle = Math.atan2(deltaY, deltaX);
+        const thumbX = distance * Math.cos(angle);
+        const thumbY = distance * Math.sin(angle);
 
-        const thumbX = centerX + distance * Math.cos(angle);
-        const thumbY = centerY + distance * Math.sin(angle);
+        thumb.style.transform = `translate(calc(-50% + ${thumbX}px), calc(-50% + ${thumbY}px))`;
 
-        // GPU accelerated com transform
-        thumb.style.transform = `translate(${thumbX - rect.left - thumb.clientWidth / 2}px, ${thumbY - rect.top - thumb.clientHeight / 2}px)`;
+        const direction = getDirection(deltaX, deltaY);
+        if (direction !== lastDirection) {
+            lastDirection = direction;
+            emulateKeys(direction);
+        }
+    }, 16, "joystick-update");
 
-        const directionIndex = getDirection(deltaX, deltaY);
-        emulateKeys(DIRECTIONS[directionIndex]);
-    }, 16, "joystick-update"); // ~60fps
+    function emulateKeys(direction) {
+        const keyMap = {
+            'w': { code: 'KeyW', event: direction.includes('w') ? 'keydown' : 'keyup' },
+            'a': { code: 'KeyA', event: direction.includes('a') ? 'keydown' : 'keyup' },
+            's': { code: 'KeyS', event: direction.includes('s') ? 'keydown' : 'keyup' },
+            'd': { code: 'KeyD', event: direction.includes('d') ? 'keydown' : 'keyup' }
+        };
+
+        for (const [key, { code, event }] of Object.entries(keyMap)) {
+            dispatchKeyEvent(event, code);
+        }
+    }
+
+    function dispatchKeyEvent(type, code) {
+        try {
+            document.dispatchEvent(new KeyboardEvent(type, { code, bubbles: true }));
+        } catch (e) {
+            console.error("Erro ao disparar evento:", e);
+        }
+    }
 
     function handleTouchStart(e) {
-        if (!joystick) return;
         isTouching = true;
         updateJoystickThrottled(e.touches[0]);
     }
 
     function handleTouchMove(e) {
-        if (!joystick || !isTouching) return;
-        e.preventDefault(); // Evita scroll
+        if (!isTouching) return;
+        e.preventDefault();
         updateJoystickThrottled(e.touches[0]);
     }
 
     function handleTouchEnd() {
         isTouching = false;
-        resetJoystick();
-    }
-
-    function resetJoystick() {
-        if (!joystick || !thumb) return;
-
-        thumb.style.transform = `translate(${joystick.clientWidth / 2 - thumb.clientWidth / 2}px, ${joystick.clientHeight / 2 - thumb.clientHeight / 2}px)`;
+        thumb.style.transform = `translate(-50%, -50%)`;
         emulateKeys("");
-        lastJoystickDirection = "";
+        lastDirection = "";
     }
 
-    function kick(pressed) {
-        if (pressed === lastKickState) return;
-        lastKickState = pressed;
-        dispatchKeyEvent(pressed ? "keydown" : "keyup", "KeyX");
+    function handleKickStart() {
+        if (lastKickState) return;
+        lastKickState = true;
+        dispatchKeyEvent('keydown', 'KeyX');
+    }
+
+    function handleKickEnd() {
+        if (!lastKickState) return;
+        lastKickState = false;
+        dispatchKeyEvent('keyup', 'KeyX');
     }
 
     function setup() {
-        // Cria joystick
-        joystick = document.createElement("div");
-        joystick.setAttribute("class", "neo rounded sizer");
-        joystick.setAttribute("view", "hidden");
-        joystick.setAttribute("id", "joystick");
-        joystick.innerHTML = '<div id="thumb" class="rounded" float></div>';
-
-        thumb = joystick.querySelector("#thumb");
-
-        // Event delegation com throttle
-        joystick.addEventListener('touchstart', handleTouchStart);
+        createUI();
+        
+        joystick.addEventListener('touchstart', handleTouchStart, { passive: false });
         joystick.addEventListener('touchmove', handleTouchMove, { passive: false });
-        joystick.addEventListener('touchend', handleTouchEnd);
+        joystick.addEventListener('touchend', handleTouchEnd, { passive: false });
+        
+        kickButton.addEventListener('touchstart', handleKickStart, { passive: false });
+        kickButton.addEventListener('touchend', handleKickEnd, { passive: false });
+        kickButton.addEventListener('mousedown', handleKickStart);
+        kickButton.addEventListener('mouseup', handleKickEnd);
 
-        // Cria botão de chute
-        kickButton = document.createElement("button");
-        kickButton.setAttribute("class", "neo rounded sizer");
-        kickButton.setAttribute("view", "hidden");
-        kickButton.setAttribute("id", "kick");
-        kickButton.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path d="M290 49c-16 0-32 14-38 36-6 25 5 48 22 52 18 5 39-10 45-35 7-25-5-48-22-52l-7-1zM89 68 78 87c32 24 52 51 59 83 6 27 5 53-6 77-10 23-28 41-50 51l12 19c28-12 50-35 63-63 14-30 15-64 6-99-8-33-27-63-64-93l-9-12z"/></svg>';
-
-        kickButton.addEventListener('touchstart', () => kick(true));
-        kickButton.addEventListener('touchend', () => kick(false));
-
-        document.body.appendChild(joystick);
-        document.body.appendChild(kickButton);
-
-        resetJoystick();
+        show(false);
     }
 
     function show(visible) {
         if (!joystick || !kickButton) return;
-        const view = visible ? "visible" : "hidden";
-        joystick.setAttribute("view", view);
-        kickButton.setAttribute("view", view);
+        joystick.style.display = visible ? 'block' : 'none';
+        kickButton.style.display = visible ? 'block' : 'none';
     }
 
-    return {
-        setup,
-        show,
-        reset: resetJoystick,
-        kick,
-        emulateKeys
-    };
+    return { setup, show, emulateKeys: (dir) => emulateKeys(dir) };
 })();
 
 // ============================================================================
-// 5. GAMEPAD SUPPORT - Sem loops recursivos
+// 4. SCREEN STATE DETECTOR - Detecta quando está em jogo
 // ============================================================================
 
-const GamepadSystem = (() => {
-    let gamepadAnimationId = null;
-    let previousDirections = new Map(); // Rastreia estado anterior
-    let isKickPressed = false;
+const ScreenDetector = (() => {
+    let isInGame = false;
+    let lastDetection = 0;
+    const DETECTION_INTERVAL = 500; // 500ms
 
-    const GAMEPAD_THRESHOLD_CENTER = 0.1;
-    const GAMEPAD_THRESHOLD_MOTION = 0.5;
+    function detect() {
+        const now = performance.now();
+        if (now - lastDetection < DETECTION_INTERVAL) return isInGame;
+        lastDetection = now;
 
-    function getDirectionFromAxis(x, y) {
-        if (Math.abs(x) < GAMEPAD_THRESHOLD_CENTER && Math.abs(y) < GAMEPAD_THRESHOLD_CENTER) {
-            return "center";
-        }
-        if (Math.abs(x) > GAMEPAD_THRESHOLD_MOTION || Math.abs(y) > GAMEPAD_THRESHOLD_MOTION) {
-            const angle = Math.atan2(y, x);
-            const angleInDegrees = (angle >= 0 ? angle : 2 * Math.PI + angle) * (180 / Math.PI);
-            const directions = ["d", "sd", "s", "sa", "a", "wa", "w", "wd"];
-            return directions[Math.round(angleInDegrees / 45) % 8];
-        }
-        return null;
-    }
+        // Detecta tela de jogo procurando elementos específicos
+        const indicators = [
+            document.querySelector('canvas'),
+            document.querySelector('[class*="game"]'),
+            document.querySelector('[class*="score"]'),
+            document.querySelector('[class*="timer"]')
+        ];
 
-    function pollGamepads() {
-        const gamepads = navigator.getGamepads?.();
-        if (!gamepads) return;
+        const detectedGame = indicators.some(el => el !== null);
 
-        for (let i = 0; i < gamepads.length; i++) {
-            const gamepad = gamepads[i];
-            if (!gamepad) continue;
-
-            // Stick esquerdo (movimento)
-            const leftDir = getDirectionFromAxis(gamepad.axes[0], gamepad.axes[1]);
-            const prevLeftDir = previousDirections.get(`left-${i}`);
-            if (leftDir !== prevLeftDir) {
-                if (leftDir && leftDir !== "center") {
-                    ControlSystem.emulateKeys?.(leftDir);
-                } else {
-                    ControlSystem.emulateKeys?.("");
-                }
-                previousDirections.set(`left-${i}`, leftDir);
-            }
-
-            // Botões de chute (A e X buttons)
-            const buttonPressed = gamepad.buttons[0]?.pressed || gamepad.buttons[2]?.pressed;
-            if (buttonPressed !== isKickPressed) {
-                ControlSystem.kick?.(buttonPressed);
-                isKickPressed = buttonPressed;
-            }
+        if (detectedGame !== isInGame) {
+            isInGame = detectedGame;
+            console.log(`[HaxZero] Tela: ${isInGame ? 'JOGO' : 'MENU'}`);
+            VirtualJoystick.show(isInGame);
         }
 
-        gamepadAnimationId = requestAnimationFrame(pollGamepads);
+        return isInGame;
     }
 
     function start() {
-        if (!gamepadAnimationId) {
-            gamepadAnimationId = requestAnimationFrame(pollGamepads);
+        setInterval(detect, DETECTION_INTERVAL);
+    }
+
+    return { start, detect, isInGame: () => isInGame };
+})();
+
+// ============================================================================
+// 5. GAME LOOP - Mantém o joystick sincronizado
+// ============================================================================
+
+const GameLoop = (() => {
+    let rafId = null;
+
+    function loop() {
+        ScreenDetector.detect();
+        rafId = requestAnimationFrame(loop);
+    }
+
+    function start() {
+        if (!rafId) {
+            rafId = requestAnimationFrame(loop);
         }
     }
 
     function stop() {
-        if (gamepadAnimationId) {
-            cancelAnimationFrame(gamepadAnimationId);
-            gamepadAnimationId = null;
+        if (rafId) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
         }
     }
-
-    window.addEventListener("gamepadconnected", () => {
-        console.log("[HaxZero] Gamepad conectado");
-        start();
-    });
-
-    window.addEventListener("gamepaddisconnected", () => {
-        console.log("[HaxZero] Gamepad desconectado");
-    });
 
     return { start, stop };
 })();
 
 // ============================================================================
-// 6. UI MANAGER - Observa mudanças sem overhead
-// ============================================================================
-
-const UIManager = (() => {
-    let observer = null;
-    let lastViewState = null;
-
-    const VIEW_STATES = {
-        LOADING: "loading",
-        NICKNAME: "nickname",
-        ROOMLIST: "roomlist",
-        CREATE_ROOM: "create_room",
-        SETTINGS: "settings",
-        GAME: "game",
-        ADMIN: "admin",
-        CAPTCHA: "captcha",
-        UNKNOWN: "unknown"
-    };
-
-    /**
-     * Detecta view atual
-     * Otimizado: evita múltiplas queries
-     */
-    function detectViewState(body) {
-        if (!body) return VIEW_STATES.UNKNOWN;
-
-        if (body.querySelector('.loader-view')) return VIEW_STATES.LOADING;
-        if (body.querySelector('.choose-nickname-view')) return VIEW_STATES.NICKNAME;
-        if (body.querySelector('.roomlist-view')) return VIEW_STATES.ROOMLIST;
-        if (body.querySelector('.create-room-view')) return VIEW_STATES.CREATE_ROOM;
-        if (body.querySelector('.settings-view')) return VIEW_STATES.SETTINGS;
-        if (body.querySelector('.g-recaptcha-response')) return VIEW_STATES.CAPTCHA;
-        if (body.querySelector('.game-view')) {
-            if (body.querySelector('.room-view')) return VIEW_STATES.GAME;
-            if (body.querySelector('.room-link-view')) return VIEW_STATES.ADMIN;
-            return VIEW_STATES.ADMIN;
-        }
-
-        return VIEW_STATES.UNKNOWN;
-    }
-
-    /**
-     * Processa mudanças de view
-     */
-    function updateUI(body) {
-        const currentView = detectViewState(body);
-
-        if (currentView === lastViewState) return;
-        lastViewState = currentView;
-
-        console.log(`[HaxZero] View changed: ${currentView}`);
-
-        // Dispatch de eventos por view
-        switch (currentView) {
-            case VIEW_STATES.GAME:
-                ControlSystem.show(true);
-                GamepadSystem.start();
-                break;
-            case VIEW_STATES.NICKNAME:
-            case VIEW_STATES.ROOMLIST:
-            case VIEW_STATES.SETTINGS:
-                ControlSystem.show(false);
-                GamepadSystem.stop();
-                break;
-            case VIEW_STATES.CAPTCHA:
-                ControlSystem.show(false);
-                GamepadSystem.stop();
-                break;
-        }
-    }
-
-    /**
-     * Throttled update para evitar múltiplas execuções
-     */
-    const updateUIThrottled = PerfUtils.throttle(updateUI, 100, "ui-update");
-
-    function init(body) {
-        if (!body) return;
-
-        // Mutation Observer otimizado: subtree: false
-        const config = { childList: true, subtree: false };
-        observer = new MutationObserver(() => {
-            updateUIThrottled(body);
-        });
-
-        observer.observe(body, config);
-        updateUI(body); // Primeira execução
-    }
-
-    function destroy() {
-        if (observer) {
-            observer.disconnect();
-            observer = null;
-        }
-    }
-
-    return { init, destroy, detectViewState, VIEW_STATES };
-})();
-
-// ============================================================================
-// 7. INITIALIZATION
+// 6. INITIALIZATION
 // ============================================================================
 
 const HaxZero = (() => {
-    let isInitialized = false;
-    let initAttempts = 0;
-    const MAX_INIT_ATTEMPTS = 30; // 30 segundos max
+    let initialized = false;
 
     function init() {
-        if (isInitialized) return;
-
-        const gameFrame = document.querySelector('.gameframe')?.contentWindow;
-        if (!gameFrame?.document.body) {
-            initAttempts++;
-            if (initAttempts > MAX_INIT_ATTEMPTS) {
-                console.error("[HaxZero] Falha ao inicializar após 30s");
-                return;
-            }
-            setTimeout(init, 1000);
-            return;
-        }
+        if (initialized) return;
 
         try {
-            console.log("[HaxZero] Inicializando...");
+            console.log("[HaxZero] v1.1 - Inicializando...");
+            
+            VirtualJoystick.setup();
+            ScreenDetector.start();
+            GameLoop.start();
 
-            // Remove ads
-            try {
-                document.querySelector('.rightbar')?.remove();
-                document.querySelector('.header')?.remove();
-            } catch (e) {
-                console.warn("[HaxZero] Erro ao remover ads:", e);
-            }
+            // Previne saída acidental
+            window.addEventListener('beforeunload', (e) => {
+                if (ScreenDetector.isInGame()) {
+                    e.preventDefault();
+                    e.returnValue = '';
+                }
+            });
 
-            // Setup
-            DOMCache.init(gameFrame);
-            DOMCache.setBody(gameFrame.document.body.children[0]);
-            ControlSystem.setup();
-            UIManager.init(gameFrame.document.body.children[0]);
-
-            // Viewport otimizado
-            const viewport = document.querySelector("meta[name=viewport]");
-            if (viewport) {
-                viewport.setAttribute('content', 
-                    'width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=0');
-            }
-
-            isInitialized = true;
+            initialized = true;
             console.log("[HaxZero] ✅ Inicializado com sucesso!");
-            console.log("[HaxZero] 📊 Monitore performance no DevTools");
+            console.log("[HaxZero] 🎮 Joystick overlay ativado!");
+            console.log("[HaxZero] 📍 Esquerda: Movimento | Direita: Chute");
         } catch (e) {
-            console.error("[HaxZero] Erro durante inicialização:", e);
-            isInitialized = false;
-            initAttempts++;
-            if (initAttempts <= MAX_INIT_ATTEMPTS) {
-                setTimeout(init, 1000);
-            }
+            console.error("[HaxZero] Erro na inicialização:", e);
         }
     }
 
@@ -632,7 +370,7 @@ const HaxZero = (() => {
 })();
 
 // ============================================================================
-// 8. AUTO-START
+// 7. AUTO-START
 // ============================================================================
 
 if (document.readyState === 'loading') {
@@ -641,4 +379,4 @@ if (document.readyState === 'loading') {
     HaxZero.init();
 }
 
-console.log("[HaxZero] v1.0 - Script carregado");
+console.log("[HaxZero] v1.1 - Script carregado");
